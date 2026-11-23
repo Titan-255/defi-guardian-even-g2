@@ -1,0 +1,16 @@
+HOW TO STOP THE DEFI GUARDIAN DEMO
+==================================
+
+1. To stop the running servers:
+   - Simply close the two black command windows:
+     * "DeFi Guardian - Backend Server"
+     * "DeFi Guardian - G2 Frontend"
+   - Or click inside either command window and press Ctrl + C, then type Y and Enter.
+
+2. To reset the paper trading account back to $10,000 simulated cash:
+   - Go to Screen 7 (Settings) in the application and click "RESET TO $10K".
+   - Or execute an HTTP POST to:
+     http://127.0.0.1:8000/api/demo/reset
+
+3. To relaunch the demo anytime:
+   - Double-click START_DEMO.bat

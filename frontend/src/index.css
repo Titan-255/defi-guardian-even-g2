@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .hud-glow {
+    text-shadow: 0 0 8px rgba(0, 230, 118, 0.6);
+  }
+  .hud-box-glow {
+    box-shadow: 0 0 12px rgba(0, 230, 118, 0.25);
+  }
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #09110b;
+}
+::-webkit-scrollbar-thumb {
+  background: #173722;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #255a36;
+}

@@ -1,0 +1,19 @@
+{
+  "package_id": "com.defiguardian.app",
+  "edition": "202601",
+  "name": "DeFi Guardian",
+  "version": "1.0.0",
+  "min_sdk_version": "0.0.10",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "network",
+      "desc": "Connects to DeFi Guardian backend for real-time market data, anomaly analysis, and paper trading.",
+      "whitelist": [
+        "http://127.0.0.1:8000",
+        "http://localhost:8000"
+      ]
+    }
+  ],
+  "supported_languages": ["en"]
+}
