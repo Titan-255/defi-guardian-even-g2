@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { TradePreview, PaperPortfolio } from '../types';
-import { api } from '../services/api';
+import { api, ApiValidationError } from '../services/api';
 
 interface Props {
   portfolio: PaperPortfolio | null;
@@ -13,24 +13,38 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
   const [action, setAction] = useState<'BUY' | 'SELL'>('BUY');
   const [amount, setAmount] = useState<number>(50);
   const [preview, setPreview] = useState<TradePreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [tradeStatus, setTradeStatus] = useState<string | null>(null);
+
+  const loadPreview = useCallback(async (c: string, act: 'BUY' | 'SELL', amt: number) => {
+    try {
+      const res = await api.previewTrade(c, act, amt);
+      setPreview(res);
+      setPreviewError(null);
+    } catch (err: any) {
+      setPreview(null);
+      setPreviewError(`Preview error: ${err.message}`);
+    }
+  }, []);
 
   // Load preview whenever coin, action, or amount changes
   useEffect(() => {
     let isCurrent = true;
-    const fetchPreview = async () => {
+    (async () => {
       try {
         const res = await api.previewTrade(coin, action, amount);
-        if (isCurrent) setPreview(res);
+        if (isCurrent) {
+          setPreview(res);
+          setPreviewError(null);
+        }
       } catch (err: any) {
         if (isCurrent) {
           setPreview(null);
-          setTradeStatus(`Preview error: ${err.message}`);
+          setPreviewError(`Preview error: ${err.message}`);
         }
       }
-    };
-    fetchPreview();
+    })();
     return () => {
       isCurrent = false;
     };
@@ -42,16 +56,30 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
     setIsSubmitting(true);
     setTradeStatus('EXECUTING SIMULATED ORDER...');
     try {
-      const res = await api.confirmTrade(coin, action, amount);
+      const res = await api.confirmTrade(
+        coin,
+        action,
+        amount,
+        preview.current_price,
+        preview.preview_timestamp
+      );
       if (res.success) {
+        setPreviewError(null);
         setTradeStatus(`SUCCESS! ${action} ${res.quantity.toFixed(4)} ${coin}`);
         onTradeExecuted();
-        // Clear message after 3 seconds
+        loadPreview(coin, action, amount);
         setTimeout(() => setTradeStatus(null), 3000);
       }
     } catch (err: any) {
-      setTradeStatus(`Failed: ${err.message}`);
-      setTimeout(() => setTradeStatus(null), 3500);
+      if (err instanceof ApiValidationError && err.status === 409) {
+        // Stale or drifted quote: refresh preview and require explicit re-confirmation
+        setTradeStatus(err.message);
+        await loadPreview(coin, action, amount);
+        setTimeout(() => setTradeStatus(null), 4000);
+      } else {
+        setTradeStatus(`Failed: ${err.message}`);
+        setTimeout(() => setTradeStatus(null), 3500);
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -61,14 +89,17 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
   const coins = ['BTC', 'ETH', 'SOL'];
 
   return (
-    <div className="w-full h-full flex flex-col justify-between p-3 bg-black text-[#00e676] font-mono select-none">
+    <div
+      className="w-full h-full flex flex-col justify-between p-3 bg-black text-[#00e676] font-mono select-none"
+      onClick={(e) => e.stopPropagation()}
+    >
       {/* Header */}
       <div className="flex justify-between items-center border-b border-[#1a3322] pb-1">
         <div className="flex items-center space-x-2">
           <span className="text-[11px] font-bold tracking-widest text-[#69f0ae]">PAPER TRADING</span>
-          <span className="text-[8px] bg-[#00441b] text-[#69f0ae] px-1 py-0.5 rounded">SIMULATOR</span>
+          <span className="text-[9px] bg-[#00441b] text-[#69f0ae] px-1 py-0.5 rounded">SIMULATOR</span>
         </div>
-        <span className="text-[10px] text-[#81c784]">
+        <span className="text-[11px] text-[#81c784]">
           Cash: ${portfolio?.available_cash.toFixed(0) ?? '10,000'}
         </span>
       </div>
@@ -76,12 +107,14 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
       {/* Selectors Bar */}
       <div className="grid grid-cols-3 gap-1 my-1">
         {/* Coin Selector */}
-        <div className="flex bg-[#050f08] border border-[#1a3322] rounded p-0.5">
+        <div className="flex bg-[#050f08] border border-[#1a3322] rounded p-0.5" role="group" aria-label="Select asset">
           {coins.map((c) => (
             <button
               key={c}
+              type="button"
               onClick={() => setCoin(c)}
-              className={`flex-1 text-[9px] py-0.5 rounded transition ${
+              aria-pressed={coin === c}
+              className={`flex-1 text-[10px] py-0.5 rounded transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#00e676] ${
                 coin === c ? 'bg-[#00e676] text-black font-bold' : 'text-[#81c784]'
               }`}
             >
@@ -91,18 +124,22 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
         </div>
 
         {/* Action Selector */}
-        <div className="flex bg-[#050f08] border border-[#1a3322] rounded p-0.5">
+        <div className="flex bg-[#050f08] border border-[#1a3322] rounded p-0.5" role="group" aria-label="Select action">
           <button
+            type="button"
             onClick={() => setAction('BUY')}
-            className={`flex-1 text-[9px] py-0.5 rounded transition ${
+            aria-pressed={action === 'BUY'}
+            className={`flex-1 text-[10px] py-0.5 rounded transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#00e676] ${
               action === 'BUY' ? 'bg-[#00e676] text-black font-bold' : 'text-[#81c784]'
             }`}
           >
             BUY
           </button>
           <button
+            type="button"
             onClick={() => setAction('SELL')}
-            className={`flex-1 text-[9px] py-0.5 rounded transition ${
+            aria-pressed={action === 'SELL'}
+            className={`flex-1 text-[10px] py-0.5 rounded transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#00e676] ${
               action === 'SELL' ? 'bg-[#00e676] text-black font-bold' : 'text-[#81c784]'
             }`}
           >
@@ -111,12 +148,14 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
         </div>
 
         {/* Amount Selector */}
-        <div className="flex bg-[#050f08] border border-[#1a3322] rounded p-0.5">
+        <div className="flex bg-[#050f08] border border-[#1a3322] rounded p-0.5" role="group" aria-label="Select amount">
           {amounts.map((amt) => (
             <button
               key={amt}
+              type="button"
               onClick={() => setAmount(amt)}
-              className={`flex-1 text-[9px] py-0.5 rounded transition ${
+              aria-pressed={amount === amt}
+              className={`flex-1 text-[10px] py-0.5 rounded transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#00e676] ${
                 amount === amt ? 'bg-[#00e676] text-black font-bold' : 'text-[#81c784]'
               }`}
             >
@@ -127,14 +166,21 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
       </div>
 
       {/* Order Preview Box */}
-      <div className="border border-[#1a3322] bg-[#050f08] p-2 rounded flex flex-col justify-between my-0.5">
+      <div
+        className="border border-[#1a3322] bg-[#050f08] p-2 rounded flex flex-col justify-between my-0.5"
+        aria-live="polite"
+      >
         {tradeStatus ? (
-          <div className="text-center py-2 text-xs font-bold text-white hud-glow">
+          <div className="text-center py-1.5 text-xs font-bold text-white hud-glow">
             {tradeStatus}
+          </div>
+        ) : previewError ? (
+          <div className="text-center py-1.5 text-[11px] text-[#ff8a80]">
+            {previewError}
           </div>
         ) : preview ? (
           <>
-            <div className="flex justify-between items-center text-[10px]">
+            <div className="flex justify-between items-center text-[11px]">
               <span className="text-[#81c784]">
                 {action} {coin} @ ${preview.current_price.toLocaleString()}
               </span>
@@ -142,36 +188,37 @@ export const PaperTradingView: React.FC<Props> = ({ portfolio, onTradeExecuted, 
                 Qty: {preview.calculated_quantity.toFixed(6)}
               </span>
             </div>
-            <div className="flex justify-between items-center text-[9px] text-[#2e7d32] mt-1 border-t border-[#1a3322] pt-1">
+            <div className="flex justify-between items-center text-[10px] text-[#4caf50] mt-1 border-t border-[#1a3322] pt-1">
               <span>Cash after: ${preview.cash_after_trade.toFixed(2)}</span>
               <span>Holding after: {preview.holding_after_trade.toFixed(4)} {coin}</span>
             </div>
             {!preview.valid && (
-              <div className="text-[9px] text-[#ff8a80] mt-0.5">
+              <div className="text-[10px] text-[#ff8a80] mt-0.5">
                 {preview.error_message}
               </div>
             )}
           </>
         ) : (
-          <div className="text-center text-[10px] text-[#2e7d32]">Loading price preview...</div>
+          <div className="text-center text-[11px] text-[#4caf50]">Loading price preview...</div>
         )}
       </div>
 
       {/* Confirmation Button */}
       <button
+        type="button"
         onClick={handleConfirmTrade}
         disabled={!preview?.valid || isSubmitting}
-        className={`w-full py-1.5 rounded text-xs font-bold tracking-wider transition ${
+        className={`w-full py-1.5 rounded text-xs font-bold tracking-wider transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#69f0ae] ${
           preview?.valid && !isSubmitting
             ? 'bg-[#00e676] text-black hover:bg-[#69f0ae] active:scale-[0.98]'
-            : 'bg-[#1a3322] text-[#2e7d32] cursor-not-allowed'
+            : 'bg-[#1a3322] text-[#4caf50] cursor-not-allowed'
         }`}
       >
         {isSubmitting ? 'CONFIRMING...' : `CONFIRM ${action} $${amount} ${coin}`}
       </button>
 
       {/* Footer */}
-      <div className="flex justify-between items-center text-[9px] text-[#2e7d32] border-t border-[#1a3322] pt-0.5 mt-0.5">
+      <div className="flex justify-between items-center text-[10px] text-[#4caf50] border-t border-[#1a3322] pt-0.5 mt-0.5">
         <span>PAPER ACCOUNT — NOT REAL MONEY</span>
         <span className="text-[#69f0ae]">Tap: Next Screen</span>
       </div>

@@ -7,7 +7,8 @@ import {
   TradeRecord,
   PriceAlert,
   PublicWallet,
-  BackendHealth
+  BackendHealth,
+  OperatingMode
 } from './types';
 import { api } from './services/api';
 import { evenBridge } from './services/evenBridge';
@@ -36,8 +37,9 @@ export const App: React.FC = () => {
   const [selectedCoin, setSelectedCoin] = useState<string>('BTC');
   const [portfolioMode, setPortfolioMode] = useState<'PAPER' | 'PUBLIC'>('PAPER');
 
-  // Backend state
+  // Backend / Cloud state
   const [health, setHealth] = useState<BackendHealth | null>(null);
+  const [operatingMode, setOperatingMode] = useState<OperatingMode>(api.getOperatingMode());
   const [market, setMarket] = useState<MarketOverview | null>(null);
   const [intel, setIntel] = useState<IntelligenceData | null>(null);
   const [portfolio, setPortfolio] = useState<PaperPortfolio | null>(null);
@@ -45,20 +47,51 @@ export const App: React.FC = () => {
   const [alerts, setAlerts] = useState<PriceAlert[]>([]);
   const [wallet, setWallet] = useState<PublicWallet | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [dataError, setDataError] = useState<string | null>(null);
   const [isBridgeActive, setIsBridgeActive] = useState<boolean>(false);
   const [lastNotification, setLastNotification] = useState<string | null>(null);
 
-  // Ref to track activeScreen inside callbacks without stale closures
+  // Refs to avoid stale closures and prevent overlapping polls
   const activeScreenRef = useRef(activeScreen);
   activeScreenRef.current = activeScreen;
+  const selectedCoinRef = useRef(selectedCoin);
+  selectedCoinRef.current = selectedCoin;
+  const isPollingRef = useRef(false);
+  const notifiedAlertsRef = useRef<Set<number>>(new Set());
 
-  // 1. Fetch data functions
-  const fetchMarketData = useCallback(async () => {
+  const syncMode = () => setOperatingMode(api.getOperatingMode());
+
+  const fetchMarketAndCheckAlerts = useCallback(async () => {
     try {
       const m = await api.getMarket();
       setMarket(m);
-    } catch (e) {
-      console.warn('Failed to fetch market data:', e);
+      setDataError(null);
+      syncMode();
+
+      const [a, checkRes] = await Promise.all([
+        api.getAlerts(),
+        api.checkAlerts(m),
+      ]);
+      setAlerts(a);
+
+      if (checkRes.triggered_count > 0) {
+        const fresh = checkRes.triggered_alerts.find(
+          (al) => !notifiedAlertsRef.current.has(al.id) || al.repeat
+        );
+        if (fresh) {
+          notifiedAlertsRef.current.add(fresh.id);
+          setLastNotification(`ALERT: ${fresh.coin} reached $${fresh.target_price.toLocaleString()}!`);
+          setTimeout(() => setLastNotification(null), 4000);
+          // Refresh alert list so deactivated one-time status appears immediately
+          const updatedAlerts = await api.getAlerts();
+          setAlerts(updatedAlerts);
+        }
+      }
+      return m;
+    } catch (e: any) {
+      syncMode();
+      setDataError(e?.message || 'Unable to fetch live market prices.');
+      return null;
     }
   }, []);
 
@@ -66,71 +99,78 @@ export const App: React.FC = () => {
     try {
       const i = await api.getIntelligence(coin);
       setIntel(i);
+      syncMode();
     } catch (e) {
-      console.warn('Failed to fetch intelligence data:', e);
+      syncMode();
+      setIntel(null);
     }
   }, []);
 
-  const fetchPortfolioAndTrades = useCallback(async () => {
+  const fetchPortfolioAndTrades = useCallback(async (sharedMarket?: MarketOverview | null) => {
     try {
       const [p, t, w] = await Promise.all([
-        api.getPortfolio(),
+        api.getPortfolio(sharedMarket),
         api.getTrades(),
         api.getWallet(),
       ]);
       setPortfolio(p);
       setTrades(t);
       setWallet(w);
-    } catch (e) {
-      console.warn('Failed to fetch portfolio data:', e);
+      syncMode();
+    } catch {
+      syncMode();
     }
   }, []);
 
   const fetchAlertsAndCheck = useCallback(async () => {
-    try {
-      const a = await api.getAlerts();
-      setAlerts(a);
-      // Check triggers
-      const checkRes = await api.checkAlerts();
-      if (checkRes.triggered_count > 0) {
-        const top = checkRes.triggered_alerts[0];
-        setLastNotification(`ALERT: ${top.coin} reached $${top.target_price}!`);
-        setTimeout(() => setLastNotification(null), 4000);
-      }
-    } catch (e) {
-      console.warn('Failed to fetch/check alerts:', e);
-    }
-  }, []);
+    await fetchMarketAndCheckAlerts();
+  }, [fetchMarketAndCheckAlerts]);
 
   const refreshAll = useCallback(async () => {
     setIsLoading(true);
     try {
       const h = await api.getHealth();
       setHealth(h);
+      syncMode();
+      const m = await fetchMarketAndCheckAlerts();
       await Promise.all([
-        fetchMarketData(),
-        fetchIntelligence(selectedCoin),
-        fetchPortfolioAndTrades(),
-        fetchAlertsAndCheck(),
+        fetchIntelligence(selectedCoinRef.current),
+        fetchPortfolioAndTrades(m),
       ]);
-    } catch (err) {
-      console.error('Refresh all error:', err);
+    } catch (err: any) {
+      setDataError(err?.message || 'Connection refresh failed.');
     } finally {
       setIsLoading(false);
     }
-  }, [fetchMarketData, fetchIntelligence, selectedCoin, fetchPortfolioAndTrades, fetchAlertsAndCheck]);
+  }, [fetchMarketAndCheckAlerts, fetchIntelligence, fetchPortfolioAndTrades]);
 
-  // Initial load
+  // Initial load + visibility-aware single polling loop (no overlapping calls)
   useEffect(() => {
     refreshAll();
-    const interval = setInterval(() => {
-      fetchMarketData();
-      fetchAlertsAndCheck();
-    }, 6000);
-    return () => clearInterval(interval);
-  }, [refreshAll, fetchMarketData, fetchAlertsAndCheck]);
 
-  // Whenever selectedCoin changes, refresh intelligence
+    const runPoll = async () => {
+      if (document.hidden || isPollingRef.current) return;
+      isPollingRef.current = true;
+      try {
+        await fetchMarketAndCheckAlerts();
+      } finally {
+        isPollingRef.current = false;
+      }
+    };
+
+    const interval = setInterval(runPoll, 6000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) runPoll();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [refreshAll, fetchMarketAndCheckAlerts]);
+
+  // Only refresh Intelligence when selectedCoin changes
   useEffect(() => {
     fetchIntelligence(selectedCoin);
   }, [selectedCoin, fetchIntelligence]);
@@ -153,7 +193,7 @@ export const App: React.FC = () => {
     setTimeout(() => setLastNotification(null), 2500);
   }, []);
 
-  // 2. Initialize Even Hub SDK Bridge
+  // Initialize Even Hub SDK Bridge
   useEffect(() => {
     let unsubscribe: (() => void) | null = null;
     (async () => {
@@ -161,9 +201,7 @@ export const App: React.FC = () => {
       setIsBridgeActive(active);
 
       unsubscribe = evenBridge.subscribe((type) => {
-        if (type === 'CLICK') {
-          handleNextScreen();
-        } else if (type === 'SCROLL_DOWN') {
+        if (type === 'CLICK' || type === 'SCROLL_DOWN') {
           handleNextScreen();
         } else if (type === 'SCROLL_UP') {
           handlePrevScreen();
@@ -179,11 +217,10 @@ export const App: React.FC = () => {
     };
   }, [handleNextScreen, handlePrevScreen, handleDoubleTap]);
 
-  // 3. Update Even Hub SDK Display Text Containers
+  // Update Even Hub SDK Display Text Containers
   useEffect(() => {
     if (!isBridgeActive) return;
 
-    // Generate formatted plain-text representation for G2 Text Containers
     let mainText = '';
     const screenTitle = SCREENS.indexOf(activeScreen) + 1;
 
@@ -196,7 +233,7 @@ export const App: React.FC = () => {
         break;
       }
       case 'INTELLIGENCE': {
-        mainText = `AI MARKET INTELLIGENCE [${selectedCoin}]\n\nStatus: ${intel?.classification ?? 'ANALYZING'}\nScore: ${intel?.anomaly_score ?? 0}/100\n\n"${intel?.explanation ?? ''}"`;
+        mainText = `AI MARKET INTELLIGENCE [${selectedCoin}]\n\nStatus: ${intel?.classification ?? 'UNAVAILABLE'}\nScore: ${intel?.anomaly_score ?? 0}/100\n\n"${intel?.explanation ?? ''}"`;
         break;
       }
       case 'PORTFOLIO': {
@@ -212,23 +249,33 @@ export const App: React.FC = () => {
         break;
       }
       case 'ALERTS': {
-        mainText = `PRICE ALERTS\n\nActive: ${alerts.length}\n${alerts.slice(0, 2).map((a) => `${a.coin} ${a.condition} $${a.target_price}`).join('\n')}`;
+        const activeList = alerts.filter((a) => a.is_active);
+        mainText = `PRICE ALERTS\n\nActive: ${activeList.length}\n${activeList.slice(0, 2).map((a) => `${a.coin} ${a.condition} $${a.target_price}`).join('\n')}`;
         break;
       }
       case 'SETTINGS': {
-        mainText = `DEFI GUARDIAN SETTINGS\n\nBackend: ONLINE\nHyperliquid: ${health?.hyperliquid_connected ? 'CONNECTED' : 'DISCONNECTED'}\nML Engine: READY\nDatabase: PERSISTED`;
+        mainText = `DEFI GUARDIAN SETTINGS\n\nMode: ${operatingMode}\nHyperliquid: ${health?.hyperliquid_connected ? 'CONNECTED' : 'OFFLINE'}\nDetector: ${health?.ml_engine_ready ? 'READY' : 'UNAVAILABLE'}\nStorage: ${operatingMode === 'BACKEND' ? 'SQLITE' : 'BROWSER'}`;
         break;
       }
     }
 
     const navText = `Screen ${screenTitle}/7 · Tap: Next · Double-Tap: Exit`;
     evenBridge.updateDisplay(mainText, navText);
-  }, [activeScreen, selectedCoin, market, intel, portfolio, alerts, health, isBridgeActive]);
+  }, [activeScreen, selectedCoin, market, intel, portfolio, alerts, health, operatingMode, isBridgeActive]);
 
-  // Keyboard navigation for desktop browser / simulator
+  // Keyboard navigation — ignore when focus is inside interactive controls
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (['input', 'textarea'].includes((e.target as HTMLElement).tagName.toLowerCase())) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName.toLowerCase();
+        if (
+          ['input', 'textarea', 'select', 'button', 'a'].includes(tag) ||
+          target.isContentEditable
+        ) {
+          return;
+        }
+      }
 
       if (e.key === 'ArrowRight' || e.key === ' ') {
         e.preventDefault();
@@ -250,19 +297,19 @@ export const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-[#050806] text-[#e0f2e9] p-4 flex flex-col items-center justify-between font-mono">
       {/* Top Brand Banner */}
-      <header className="w-full max-w-4xl flex justify-between items-center py-2 mb-3 border-b border-[#112417]">
+      <header className="w-full max-w-4xl flex flex-wrap gap-2 justify-between items-center py-2 mb-3 border-b border-[#112417]">
         <div className="flex items-center space-x-2">
           <span className="w-2.5 h-2.5 rounded-full bg-[#00e676] hud-glow"></span>
           <h1 className="text-sm font-bold tracking-widest text-[#00e676]">
             DEFI GUARDIAN
           </h1>
-          <span className="text-[10px] text-[#2e7d32] border border-[#1a3322] px-1.5 py-0.5 rounded">
+          <span className="text-[10px] text-[#4caf50] border border-[#1a3322] px-1.5 py-0.5 rounded">
             Even Realities G2
           </span>
         </div>
         <div className="flex items-center space-x-3 text-[11px] text-[#81c784]">
           <span>Track: Crypto & DeFi</span>
-          <span className="text-[#2e7d32]">|</span>
+          <span className="text-[#4caf50]">|</span>
           <span className={health?.hyperliquid_connected ? 'text-[#00e676]' : 'text-[#ff8a80]'}>
             ● {health?.hyperliquid_connected ? 'Live API' : 'Offline'}
           </span>
@@ -271,7 +318,11 @@ export const App: React.FC = () => {
 
       {/* Floating Alert Notification Toast */}
       {lastNotification && (
-        <div className="fixed top-12 z-50 bg-[#00441b] border border-[#00e676] text-white px-4 py-1.5 rounded-full text-xs font-bold hud-box-glow animate-bounce">
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed top-12 z-50 bg-[#00441b] border border-[#00e676] text-white px-4 py-1.5 rounded-full text-xs font-bold hud-box-glow animate-bounce"
+        >
           {lastNotification}
         </div>
       )}
@@ -289,7 +340,8 @@ export const App: React.FC = () => {
             <MarketGlance
               market={market}
               isLoading={isLoading}
-              onRefresh={fetchMarketData}
+              dataError={dataError}
+              onRefresh={refreshAll}
             />
           )}
 
@@ -323,7 +375,7 @@ export const App: React.FC = () => {
             <PaperTradingView
               portfolio={portfolio}
               defaultCoin={selectedCoin}
-              onTradeExecuted={fetchPortfolioAndTrades}
+              onTradeExecuted={() => fetchPortfolioAndTrades(market)}
             />
           )}
 
@@ -339,6 +391,7 @@ export const App: React.FC = () => {
             <SettingsView
               health={health}
               wallet={wallet}
+              operatingMode={operatingMode}
               onRefreshAll={refreshAll}
             />
           )}
@@ -355,14 +408,15 @@ export const App: React.FC = () => {
           alerts={alerts}
           wallet={wallet}
           health={health}
+          operatingMode={operatingMode}
           isBridgeActive={isBridgeActive}
           onRefreshAll={refreshAll}
         />
       </main>
 
       {/* Bottom Footer */}
-      <footer className="w-full max-w-4xl text-center text-[10px] text-[#2e7d32] py-4 border-t border-[#112417] mt-4">
-        DeFi Guardian · Heads Up: Even Realities Hackathon · Non-custodial Educational Crypto Intelligence
+      <footer className="w-full max-w-4xl text-center text-[11px] text-[#4caf50] py-4 border-t border-[#112417] mt-4">
+        Market information is provided for educational and informational purposes only. DeFi Guardian does not provide financial advice or execute real-money transactions.
       </footer>
     </div>
   );

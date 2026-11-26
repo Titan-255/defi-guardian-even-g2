@@ -8,8 +8,9 @@
   "permissions": [
     {
       "name": "network",
-      "desc": "Connects to DeFi Guardian backend for real-time market data, anomaly analysis, and paper trading.",
+      "desc": "Connects to Hyperliquid public API and DeFi Guardian backend for live market data, anomaly detection, and paper trading.",
       "whitelist": [
+        "https://api.hyperliquid.xyz",
         "http://127.0.0.1:8000",
         "http://localhost:8000"
       ]

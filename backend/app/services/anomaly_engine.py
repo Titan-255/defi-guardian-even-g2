@@ -66,7 +66,7 @@ class AnomalyEngine:
                 "features": {},
                 "candle_time": datetime.now(timezone.utc).isoformat(),
                 "sample_count": len(candles),
-                "source": "Hyperliquid Candles + Local Isolation Forest",
+                "source": "Hyperliquid Candles + Isolation Forest ML Detector",
                 "disclaimer": "Informational anomaly detection only. Not financial or predictive advice."
             }
 

@@ -6,61 +6,144 @@ import {
   TradePreview,
   TradeRecord,
   PriceAlert,
-  PublicWallet
+  PublicWallet,
+  OperatingMode
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+const CONFIGURED_API_URL = (import.meta.env.VITE_API_BASE_URL || '').trim();
+const API_BASE_URL = CONFIGURED_API_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 const HYPERLIQUID_DIRECT_URL = 'https://api.hyperliquid.xyz/info';
 
-class ApiService {
-  private backendAvailable: boolean | null = null;
+const SUPPORTED_COINS = ['BTC', 'ETH', 'SOL'] as const;
+const MAX_ALERT_PRICE = 10_000_000;
+const PREVIEW_TTL_MS = 30_000;
+const PRICE_DRIFT_TOLERANCE = 0.005;
+const CANDLE_CACHE_TTL_MS = 120_000;
+const BACKEND_RECHECK_INTERVAL_MS = 15_000;
+const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
-  // Short timeout fetch helper to quickly detect if local backend is available
+/** Application/validation HTTP error (4xx) — must NOT trigger storage/mode failover. */
+export class ApiValidationError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiValidationError';
+    this.status = status;
+  }
+}
+
+function generateLocalId(): number {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const arr = new Uint32Array(1);
+    crypto.getRandomValues(arr);
+    return arr[0];
+  }
+  return Date.now() + Math.floor(Math.random() * 10000);
+}
+
+class ApiService {
+  private operatingMode: OperatingMode = API_BASE_URL ? 'BACKEND' : 'CLOUD_EDGE';
+  private lastBackendCheck = 0;
+  private sessionToken: string | null = null;
+  private candleCache: Record<string, { candles: any[]; timestamp: number }> = {};
+
+  getOperatingMode(): OperatingMode {
+    return this.operatingMode;
+  }
+
+  hasConfiguredBackend(): boolean {
+    return Boolean(API_BASE_URL);
+  }
+
   private async fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 2500): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(url, { ...options, signal: controller.signal });
-      return response;
+      return await fetch(url, { ...options, signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  private async tryBackend<T>(endpoint: string, options?: RequestInit): Promise<T> {
-    if (this.backendAvailable === false) {
-      throw new Error('Backend previously unreachable, skipping to cloud fallback');
-    }
-
-    const url = `${API_BASE_URL}${endpoint}`;
+  private async ensureSessionToken(): Promise<void> {
+    if (this.sessionToken || !API_BASE_URL) return;
     try {
-      const response = await this.fetchWithTimeout(url, {
-        ...options,
-        headers: {
-          'Content-Type': 'application/json',
-          ...(options?.headers || {})
-        }
-      }, 2000);
-
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`);
+      const resp = await this.fetchWithTimeout(`${API_BASE_URL}/api/health`, {}, 2000);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.session_token) this.sessionToken = data.session_token;
       }
-
-      this.backendAvailable = true;
-      return await response.json();
-    } catch (err: any) {
-      this.backendAvailable = false;
-      throw err;
+    } catch {
+      // ignore; tryBackend handles connectivity
     }
   }
 
-  // Direct Hyperliquid API query (CORS enabled)
+  private async tryBackend<T>(endpoint: string, options?: RequestInit, isMutating = false): Promise<T> {
+    if (!API_BASE_URL) {
+      this.operatingMode = 'CLOUD_EDGE';
+      throw new Error('No backend URL configured for production');
+    }
+
+    // Periodically recheck backend if currently in CLOUD_EDGE failover
+    if (this.operatingMode === 'CLOUD_EDGE') {
+      const now = Date.now();
+      if (now - this.lastBackendCheck < BACKEND_RECHECK_INTERVAL_MS) {
+        throw new Error('Backend in cooldown before next health recheck');
+      }
+      this.lastBackendCheck = now;
+    }
+
+    if (isMutating && !this.sessionToken) {
+      await this.ensureSessionToken();
+    }
+
+    const url = `${API_BASE_URL}${endpoint}`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options?.headers as Record<string, string> || {})
+    };
+    if (isMutating && this.sessionToken) {
+      headers['X-Session-Token'] = this.sessionToken;
+    }
+
+    let response: Response;
+    try {
+      response = await this.fetchWithTimeout(url, { ...options, headers }, 3000);
+    } catch (networkErr: any) {
+      // Genuine network failure / timeout / CORS block
+      this.operatingMode = 'CLOUD_EDGE';
+      this.lastBackendCheck = Date.now();
+      throw networkErr;
+    }
+
+    // 4xx HTTP errors are valid backend application responses (NOT offline!)
+    if (response.status >= 400 && response.status < 500) {
+      this.operatingMode = 'BACKEND';
+      let errMessage = `Request rejected (${response.status})`;
+      try {
+        const errData = await response.json();
+        if (errData.detail) errMessage = errData.detail;
+      } catch {
+        // keep default
+      }
+      throw new ApiValidationError(errMessage, response.status);
+    }
+
+    if (!response.ok) {
+      // 5xx server error
+      throw new Error(`Backend server error (${response.status})`);
+    }
+
+    this.operatingMode = 'BACKEND';
+    return await response.json();
+  }
+
   private async queryHyperliquid(body: any): Promise<any> {
-    const resp = await fetch(HYPERLIQUID_DIRECT_URL, {
+    const resp = await this.fetchWithTimeout(HYPERLIQUID_DIRECT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    });
+    }, 6000);
     if (!resp.ok) throw new Error(`Hyperliquid error: ${resp.status}`);
     return await resp.json();
   }
@@ -69,69 +152,79 @@ class ApiService {
      HEALTH
   ------------------------------------------------------------- */
   async getHealth(): Promise<BackendHealth> {
-    try {
-      return await this.tryBackend<BackendHealth>('/api/health');
-    } catch {
-      // Fallback: Test Hyperliquid direct connectivity
+    if (API_BASE_URL) {
       try {
-        await this.queryHyperliquid({ type: 'allMids' });
-        return {
-          status: 'operational',
-          timestamp: new Date().toISOString(),
-          hyperliquid_connected: true,
-          ml_engine_ready: true,
-          database_ready: true,
-          coingecko_enabled: false,
-          message: 'Running in Cloud Edge Mode (Connected to Live Hyperliquid API)'
-        };
+        // Allow probing health directly even during cooldown
+        const resp = await this.fetchWithTimeout(`${API_BASE_URL}/api/health`, {}, 2000);
+        if (resp.ok) {
+          const data: BackendHealth = await resp.json();
+          if (data.session_token) this.sessionToken = data.session_token;
+          this.operatingMode = 'BACKEND';
+          return data;
+        }
       } catch {
-        return {
-          status: 'degraded',
-          timestamp: new Date().toISOString(),
-          hyperliquid_connected: false,
-          ml_engine_ready: true,
-          database_ready: true,
-          coingecko_enabled: false,
-          message: 'Operating with cached fallback data'
-        };
+        this.operatingMode = 'CLOUD_EDGE';
+        this.lastBackendCheck = Date.now();
       }
+    }
+
+    try {
+      await this.queryHyperliquid({ type: 'allMids' });
+      this.operatingMode = 'CLOUD_EDGE';
+      return {
+        status: 'operational',
+        timestamp: new Date().toISOString(),
+        hyperliquid_connected: true,
+        ml_engine_ready: true,
+        database_ready: true,
+        coingecko_enabled: false,
+        message: 'Cloud-Edge Mode (Direct Hyperliquid API + Browser Storage)'
+      };
+    } catch {
+      this.operatingMode = 'OFFLINE';
+      return {
+        status: 'degraded',
+        timestamp: new Date().toISOString(),
+        hyperliquid_connected: false,
+        ml_engine_ready: false,
+        database_ready: false,
+        coingecko_enabled: false,
+        message: 'Network unavailable — Hyperliquid & Backend unreachable'
+      };
     }
   }
 
   /* -------------------------------------------------------------
-     MARKET OVERVIEW
+     MARKET OVERVIEW (Shared Snapshot)
   ------------------------------------------------------------- */
   async getMarket(): Promise<MarketOverview> {
     try {
       return await this.tryBackend<MarketOverview>('/api/market');
-    } catch {
-      // Cloud Fallback: Query Hyperliquid directly
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
       const mids = await this.queryHyperliquid({ type: 'allMids' });
       const nowIso = new Date().toISOString();
-      const supportedCoins = ['BTC', 'ETH', 'SOL'];
       const coinsResult: Record<string, any> = {};
 
-      for (const coin of supportedCoins) {
+      // Fetch candles using 120s cache in parallel
+      const candleResults = await Promise.all(
+        SUPPORTED_COINS.map((coin) =>
+          this.getCandles(coin, '1h', 30).catch(() => ({ candles: [] }))
+        )
+      );
+
+      SUPPORTED_COINS.forEach((coin, idx) => {
         const pStr = mids[coin];
         const price = pStr ? parseFloat(pStr) : 0.0;
-
-        // Fetch candle snapshot for 24h change
         let change24h = 0.0;
-        try {
-          const nowMs = Date.now();
-          const startMs = nowMs - 30 * 3600 * 1000;
-          const candles = await this.queryHyperliquid({
-            type: 'candleSnapshot',
-            req: { coin, interval: '1h', startTime: startMs, endTime: nowMs }
-          });
-          if (candles && candles.length >= 24) {
-            const c24Ago = parseFloat(candles[candles.length - 24].c);
-            if (c24Ago > 0 && price > 0) {
-              change24h = Math.round(((price - c24Ago) / c24Ago) * 1000) / 10;
-            }
+
+        const candles = candleResults[idx]?.candles || [];
+        if (candles.length >= 24) {
+          const c24Ago = candles[candles.length - 24].c;
+          if (c24Ago > 0 && price > 0) {
+            change24h = Math.round(((price - c24Ago) / c24Ago) * 1000) / 10;
           }
-        } catch {
-          // ignore candle failure for market mids
         }
 
         coinsResult[coin] = {
@@ -141,7 +234,7 @@ class ApiService {
           timestamp: nowIso,
           source: 'Hyperliquid Direct'
         };
-      }
+      });
 
       return {
         coins: coinsResult,
@@ -153,19 +246,34 @@ class ApiService {
   }
 
   /* -------------------------------------------------------------
-     CANDLES
+     CANDLES (120s cached in cloud mode)
   ------------------------------------------------------------- */
   async getCandles(coin: string, interval = '1h', hoursBack = 48) {
+    const coinUpper = coin.trim().toUpperCase();
     try {
       return await this.tryBackend<any>(
-        `/api/market/candles?coin=${encodeURIComponent(coin)}&interval=${interval}&hours_back=${hoursBack}`
+        `/api/market/candles?coin=${encodeURIComponent(coinUpper)}&interval=${encodeURIComponent(interval)}&hours_back=${hoursBack}`
       );
-    } catch {
-      const nowMs = Date.now();
-      const startMs = nowMs - hoursBack * 3600 * 1000;
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
+      const cacheKey = `${coinUpper}_${interval}_${hoursBack}`;
+      const cached = this.candleCache[cacheKey];
+      const now = Date.now();
+      if (cached && now - cached.timestamp < CANDLE_CACHE_TTL_MS) {
+        return {
+          coin: coinUpper,
+          interval,
+          count: cached.candles.length,
+          candles: cached.candles,
+          is_cached: false
+        };
+      }
+
+      const startMs = now - hoursBack * 3600 * 1000;
       const rawCandles = await this.queryHyperliquid({
         type: 'candleSnapshot',
-        req: { coin: coin.toUpperCase(), interval, startTime: startMs, endTime: nowMs }
+        req: { coin: coinUpper, interval, startTime: startMs, endTime: now }
       });
       const parsed = (rawCandles || []).map((c: any) => ({
         t: Number(c.t),
@@ -179,8 +287,9 @@ class ApiService {
         v: parseFloat(c.v),
         n: Number(c.n || 0)
       }));
+      this.candleCache[cacheKey] = { candles: parsed, timestamp: now };
       return {
-        coin: coin.toUpperCase(),
+        coin: coinUpper,
         interval,
         count: parsed.length,
         candles: parsed,
@@ -190,18 +299,19 @@ class ApiService {
   }
 
   /* -------------------------------------------------------------
-     AI MARKET INTELLIGENCE (Isolation Forest Logic)
+     AI MARKET INTELLIGENCE (Truthful Labels: Backend ML vs Cloud Rule-Based)
   ------------------------------------------------------------- */
   async getIntelligence(coin = 'BTC', interval = '1h', hoursBack = 72): Promise<IntelligenceData> {
+    const coinUpper = coin.trim().toUpperCase();
     try {
       return await this.tryBackend<IntelligenceData>(
-        `/api/intelligence?coin=${encodeURIComponent(coin)}&interval=${interval}&hours_back=${hoursBack}`
+        `/api/intelligence?coin=${encodeURIComponent(coinUpper)}&interval=${encodeURIComponent(interval)}&hours_back=${hoursBack}`
       );
-    } catch {
-      // Cloud Fallback: Extract statistical features from real Hyperliquid candles
-      const candlesData = await this.getCandles(coin, interval, hoursBack);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
+      const candlesData = await this.getCandles(coinUpper, interval, hoursBack);
       const candles = candlesData.candles || [];
-      const coinUpper = coin.toUpperCase();
 
       if (candles.length < 24) {
         return {
@@ -211,17 +321,16 @@ class ApiService {
           anomaly_score: 0.0,
           raw_decision_score: 0.0,
           severity: 'LOW',
-          explanation: `Model warming up. Requires at least 24 completed hourly candles (found ${candles.length}).`,
+          explanation: `Requires at least 24 completed hourly candles (found ${candles.length}).`,
           contributing_factors: ['Insufficient historical observations'],
           features: {},
           candle_time: new Date().toISOString(),
           sample_count: candles.length,
-          source: 'Hyperliquid Candles + Cloud ML Engine',
-          disclaimer: 'Informational anomaly detection only. Not financial or predictive advice.'
+          source: 'Hyperliquid Candles + Rule-Based Statistical Detector',
+          disclaimer: 'Informational statistical analysis only. Not financial or predictive advice.'
         };
       }
 
-      // Feature extraction matching Python backend
       const trainCandles = candles.slice(0, -1);
       const evalCandle = candles[candles.length - 1];
 
@@ -241,7 +350,6 @@ class ApiService {
       const bodyPct = (Math.abs(closeP - openP) / (highP - lowP + 1e-8)) * 100.0;
       const relVol = vol / Math.max(baselineVol, 1e-8);
 
-      // Quantile analysis
       const histRanges = trainCandles.map((c: any) => ((c.h - c.l) / (c.o || 1e-8)) * 100.0);
       const histRelVols = trainCandles.map((c: any, idx: number) => {
         const past = volumes.slice(Math.max(0, idx - 24), idx);
@@ -252,9 +360,8 @@ class ApiService {
       const rangePercentile = (histRanges.filter((r: number) => r < rangePct).length / histRanges.length) * 100;
       const volPercentile = (histRelVols.filter((v: number) => v < relVol).length / histRelVols.length) * 100;
 
-      // Statistical anomaly assessment
       const isAnomaly = relVol >= 2.0 || rangePct >= 2.5 || Math.abs(returnPct) >= 2.5 || volPercentile >= 90;
-      const anomalyScore = Math.min(100, Math.max(0, Math.round((Math.max(relVol, 1) * 20 + rangePct * 15 + Math.abs(returnPct) * 10))));
+      const anomalyScore = Math.min(100, Math.max(0, Math.round(Math.max(relVol, 1) * 20 + rangePct * 15 + Math.abs(returnPct) * 10)));
 
       const contributingFactors: string[] = [];
       if (relVol >= 2.0) {
@@ -280,7 +387,7 @@ class ApiService {
         } else if (rangePct >= 2.0) {
           explanation = `${coinUpper} candle range (${rangePct.toFixed(1)}%) is unusually wide compared to recent hourly baseline.`;
         } else {
-          explanation = `${coinUpper} statistical feature combination deviates from the historical cluster.`;
+          explanation = `${coinUpper} statistical feature combination deviates from recent baseline.`;
         }
       }
 
@@ -301,8 +408,8 @@ class ApiService {
         },
         candle_time: new Date(evalCandle.T).toISOString(),
         sample_count: candles.length,
-        source: 'Hyperliquid Candles + Local ML Engine',
-        disclaimer: 'Informational anomaly detection only. Not financial or predictive advice.'
+        source: 'Hyperliquid Candles + Rule-Based Statistical Detector',
+        disclaimer: 'Informational statistical analysis only. Not financial or predictive advice.'
       };
     }
   }
@@ -345,16 +452,18 @@ class ApiService {
     } catch {}
   }
 
-  async getPortfolio(): Promise<PaperPortfolio> {
+  async getPortfolio(sharedMarket?: MarketOverview | null): Promise<PaperPortfolio> {
     try {
       return await this.tryBackend<PaperPortfolio>('/api/portfolio');
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
       const local = this.getLocalPortfolio();
-      const market = await this.getMarket();
+      const market = sharedMarket || await this.getMarket();
       const holdingsList: any[] = [];
       let totalHoldingsValue = 0;
 
-      for (const coin of ['BTC', 'ETH', 'SOL']) {
+      for (const coin of SUPPORTED_COINS) {
         const item = local.holdings[coin] || { qty: 0, invested: 0 };
         const price = market.coins[coin]?.price || 0;
         const currentVal = item.qty * price;
@@ -395,7 +504,8 @@ class ApiService {
   async getTrades(limit = 20): Promise<TradeRecord[]> {
     try {
       return await this.tryBackend<TradeRecord[]>(`/api/trades?limit=${limit}`);
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
       return this.getLocalTrades().slice(0, limit);
     }
   }
@@ -406,10 +516,13 @@ class ApiService {
         method: 'POST',
         body: JSON.stringify({ coin, action, amount_usd: amountUsd })
       });
-    } catch {
-      const market = await this.getMarket();
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
+      const mids = await this.queryHyperliquid({ type: 'allMids' });
       const coinUpper = coin.toUpperCase();
-      const price = market.coins[coinUpper]?.price || 0;
+      const price = mids[coinUpper] ? parseFloat(mids[coinUpper]) : 0;
+      const nowIso = new Date().toISOString();
 
       if (!price) {
         return {
@@ -418,7 +531,7 @@ class ApiService {
           coin: coinUpper, action, amount_usd: amountUsd, current_price: 0,
           calculated_quantity: 0, simulated_fee: 0, current_cash: 0,
           cash_after_trade: 0, current_holding: 0, holding_after_trade: 0,
-          is_paper: true, label: 'SIMULATED ORDER PREVIEW'
+          preview_timestamp: nowIso, is_paper: true, label: 'SIMULATED ORDER PREVIEW'
         };
       }
 
@@ -435,7 +548,8 @@ class ApiService {
             coin: coinUpper, action, amount_usd: amountUsd, current_price: price,
             calculated_quantity: quantity, simulated_fee: 0, current_cash: currentCash,
             cash_after_trade: currentCash, current_holding: currentHolding,
-            holding_after_trade: currentHolding, is_paper: true, label: 'SIMULATED ORDER PREVIEW'
+            holding_after_trade: currentHolding, preview_timestamp: nowIso,
+            is_paper: true, label: 'SIMULATED ORDER PREVIEW'
           };
         }
         return {
@@ -443,7 +557,8 @@ class ApiService {
           coin: coinUpper, action, amount_usd: amountUsd, current_price: price,
           calculated_quantity: quantity, simulated_fee: 0, current_cash: currentCash,
           cash_after_trade: currentCash - amountUsd, current_holding: currentHolding,
-          holding_after_trade: currentHolding + quantity, is_paper: true, label: 'SIMULATED ORDER PREVIEW'
+          holding_after_trade: currentHolding + quantity, preview_timestamp: nowIso,
+          is_paper: true, label: 'SIMULATED ORDER PREVIEW'
         };
       } else {
         if (quantity > currentHolding + 1e-9) {
@@ -453,7 +568,8 @@ class ApiService {
             coin: coinUpper, action, amount_usd: amountUsd, current_price: price,
             calculated_quantity: quantity, simulated_fee: 0, current_cash: currentCash,
             cash_after_trade: currentCash, current_holding: currentHolding,
-            holding_after_trade: currentHolding, is_paper: true, label: 'SIMULATED ORDER PREVIEW'
+            holding_after_trade: currentHolding, preview_timestamp: nowIso,
+            is_paper: true, label: 'SIMULATED ORDER PREVIEW'
           };
         }
         return {
@@ -461,54 +577,95 @@ class ApiService {
           coin: coinUpper, action, amount_usd: amountUsd, current_price: price,
           calculated_quantity: quantity, simulated_fee: 0, current_cash: currentCash,
           cash_after_trade: currentCash + amountUsd, current_holding: currentHolding,
-          holding_after_trade: Math.max(0, currentHolding - quantity), is_paper: true, label: 'SIMULATED ORDER PREVIEW'
+          holding_after_trade: Math.max(0, currentHolding - quantity), preview_timestamp: nowIso,
+          is_paper: true, label: 'SIMULATED ORDER PREVIEW'
         };
       }
     }
   }
 
-  async confirmTrade(coin: string, action: 'BUY' | 'SELL', amountUsd: number) {
+  async confirmTrade(
+    coin: string,
+    action: 'BUY' | 'SELL',
+    amountUsd: number,
+    previewPrice?: number,
+    previewTimestamp?: string
+  ) {
     try {
       return await this.tryBackend<any>('/api/trades/confirm', {
         method: 'POST',
-        body: JSON.stringify({ coin, action, amount_usd: amountUsd })
-      });
-    } catch {
-      const preview = await this.previewTrade(coin, action, amountUsd);
-      if (!preview.valid) throw new Error(preview.error_message || 'Invalid simulated trade');
+        body: JSON.stringify({
+          coin,
+          action,
+          amount_usd: amountUsd,
+          preview_price: previewPrice,
+          preview_timestamp: previewTimestamp
+        })
+      }, true);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
+      // Cloud fallback: validate quote age & price drift against fresh allMids
+      if (previewTimestamp) {
+        const ageMs = Date.now() - new Date(previewTimestamp).getTime();
+        if (ageMs > PREVIEW_TTL_MS) {
+          throw new ApiValidationError('Quote expired. Preview refreshed — please confirm again.', 409);
+        }
+      }
+
+      const mids = await this.queryHyperliquid({ type: 'allMids' });
+      const coinUpper = coin.toUpperCase();
+      const execPrice = mids[coinUpper] ? parseFloat(mids[coinUpper]) : 0;
+      if (!execPrice) throw new Error(`Live price for ${coinUpper} unavailable`);
+
+      if (previewPrice && previewPrice > 0) {
+        const drift = Math.abs(execPrice - previewPrice) / previewPrice;
+        if (drift > PRICE_DRIFT_TOLERANCE) {
+          throw new ApiValidationError(
+            `${coinUpper} price changed from $${previewPrice.toFixed(2)} to $${execPrice.toFixed(2)}. Please confirm updated preview.`,
+            409
+          );
+        }
+      }
 
       const local = this.getLocalPortfolio();
-      const coinUpper = coin.toUpperCase();
-      const tradeId = `TRD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
-      const nowIso = new Date().toISOString();
+      const quantity = amountUsd / execPrice;
 
       if (action === 'BUY') {
+        if (amountUsd > local.cash) {
+          throw new ApiValidationError(`Insufficient paper cash ($${local.cash.toFixed(2)})`, 400);
+        }
         local.cash -= amountUsd;
         const prev = local.holdings[coinUpper] || { qty: 0, invested: 0 };
         local.holdings[coinUpper] = {
-          qty: prev.qty + preview.calculated_quantity,
+          qty: prev.qty + quantity,
           invested: prev.invested + amountUsd
         };
       } else {
-        local.cash += amountUsd;
         const prev = local.holdings[coinUpper] || { qty: 0, invested: 0 };
-        const fraction = prev.qty > 0 ? preview.calculated_quantity / prev.qty : 1;
+        if (quantity > prev.qty + 1e-9) {
+          throw new ApiValidationError(`Insufficient ${coinUpper} holding`, 400);
+        }
+        local.cash += amountUsd;
+        const fraction = prev.qty > 0 ? quantity / prev.qty : 1;
         local.holdings[coinUpper] = {
-          qty: Math.max(0, prev.qty - preview.calculated_quantity),
+          qty: Math.max(0, prev.qty - quantity),
           invested: Math.max(0, prev.invested * (1 - fraction))
         };
       }
 
       this.saveLocalPortfolio(local);
 
+      const tradeId = `TRD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+      const nowIso = new Date().toISOString();
       const newRecord: TradeRecord = {
-        id: Date.now(),
+        id: generateLocalId(),
         trade_id: tradeId,
         coin: coinUpper,
         action,
         amount_usd: amountUsd,
-        price: preview.current_price,
-        quantity: preview.calculated_quantity,
+        price: execPrice,
+        quantity,
         simulated_cash_after: local.cash,
         timestamp: nowIso
       };
@@ -523,18 +680,18 @@ class ApiService {
         coin: coinUpper,
         action,
         amount_usd: amountUsd,
-        price: preview.current_price,
-        quantity: preview.calculated_quantity,
+        price: execPrice,
+        quantity,
         available_cash: local.cash,
         timestamp: nowIso,
-        message: `Successfully executed paper ${action} of ${preview.calculated_quantity.toFixed(4)} ${coinUpper}`,
+        message: `Successfully executed paper ${action} of ${quantity.toFixed(4)} ${coinUpper}`,
         is_paper: true
       };
     }
   }
 
   /* -------------------------------------------------------------
-     PRICE ALERTS
+     PRICE ALERTS (One-Time Default + Shared Price Snapshot)
   ------------------------------------------------------------- */
   private getLocalAlerts(): PriceAlert[] {
     try {
@@ -553,25 +710,38 @@ class ApiService {
   async getAlerts(): Promise<PriceAlert[]> {
     try {
       return await this.tryBackend<PriceAlert[]>('/api/alerts');
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
       return this.getLocalAlerts();
     }
   }
 
-  async createAlert(coin: string, targetPrice: number, condition: 'ABOVE' | 'BELOW'): Promise<PriceAlert> {
+  async createAlert(coin: string, targetPrice: number, condition: 'ABOVE' | 'BELOW', repeat = false): Promise<PriceAlert> {
+    const coinUpper = coin.trim().toUpperCase();
+    if (!SUPPORTED_COINS.includes(coinUpper as any)) {
+      throw new ApiValidationError(`Unsupported asset: ${coin}. Supported: BTC, ETH, SOL`, 400);
+    }
+    if (!Number.isFinite(targetPrice) || targetPrice <= 0 || targetPrice > MAX_ALERT_PRICE) {
+      throw new ApiValidationError(`Target price must be between $0 and $${MAX_ALERT_PRICE.toLocaleString()}`, 400);
+    }
+
     try {
       return await this.tryBackend<PriceAlert>('/api/alerts', {
         method: 'POST',
-        body: JSON.stringify({ coin, target_price: targetPrice, condition })
-      });
-    } catch {
+        body: JSON.stringify({ coin: coinUpper, target_price: targetPrice, condition, repeat })
+      }, true);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
       const alerts = this.getLocalAlerts();
       const newAlert: PriceAlert = {
-        id: Date.now(),
-        coin: coin.toUpperCase(),
+        id: generateLocalId(),
+        coin: coinUpper,
         target_price: targetPrice,
         condition,
         is_active: true,
+        repeat,
+        cooldown_seconds: 300,
         created_at: new Date().toISOString()
       };
       alerts.unshift(newAlert);
@@ -582,34 +752,67 @@ class ApiService {
 
   async deleteAlert(alertId: number): Promise<{ success: boolean; message: string }> {
     try {
-      return await this.tryBackend(`/api/alerts/${alertId}`, { method: 'DELETE' });
-    } catch {
-      const alerts = this.getLocalAlerts().filter(a => a.id !== alertId);
-      this.saveLocalAlerts(alerts);
+      return await this.tryBackend(`/api/alerts/${alertId}`, { method: 'DELETE' }, true);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
+      const alerts = this.getLocalAlerts();
+      const filtered = alerts.filter(a => a.id !== alertId);
+      if (filtered.length === alerts.length) {
+        throw new ApiValidationError(`Alert ${alertId} not found`, 404);
+      }
+      this.saveLocalAlerts(filtered);
       return { success: true, message: `Alert ${alertId} removed` };
     }
   }
 
-  async checkAlerts(): Promise<{ triggered_count: number; triggered_alerts: PriceAlert[] }> {
+  async checkAlerts(sharedMarket?: MarketOverview | null): Promise<{ triggered_count: number; triggered_alerts: PriceAlert[] }> {
+    const pricesPayload: Record<string, number> = {};
+    if (sharedMarket?.coins) {
+      for (const [c, info] of Object.entries(sharedMarket.coins)) {
+        if (info?.price > 0) pricesPayload[c] = info.price;
+      }
+    }
+
     try {
-      return await this.tryBackend('/api/alerts/check', { method: 'POST' });
-    } catch {
+      return await this.tryBackend('/api/alerts/check', {
+        method: 'POST',
+        body: Object.keys(pricesPayload).length ? JSON.stringify({ prices: pricesPayload }) : undefined
+      });
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
       const alerts = this.getLocalAlerts();
-      const market = await this.getMarket();
+      const activeAlerts = alerts.filter(a => a.is_active);
+      if (activeAlerts.length === 0) {
+        return { triggered_count: 0, triggered_alerts: [] };
+      }
+
+      const market = sharedMarket || await this.getMarket();
       const triggered: PriceAlert[] = [];
-      const nowIso = new Date().toISOString();
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
 
       for (const a of alerts) {
         if (!a.is_active) continue;
-        const cur = market.coins[a.coin]?.price;
-        if (!cur) continue;
 
-        let isTriggered = false;
-        if (a.condition === 'ABOVE' && cur >= a.target_price) isTriggered = true;
-        if (a.condition === 'BELOW' && cur <= a.target_price) isTriggered = true;
+        if (a.repeat && a.triggered_at) {
+          const elapsedSec = (nowMs - new Date(a.triggered_at).getTime()) / 1000;
+          if (elapsedSec < (a.cooldown_seconds || 300)) continue;
+        }
+
+        const cur = market.coins[a.coin]?.price;
+        if (!cur || cur <= 0) continue;
+
+        const isTriggered =
+          (a.condition === 'ABOVE' && cur >= a.target_price) ||
+          (a.condition === 'BELOW' && cur <= a.target_price);
 
         if (isTriggered) {
           a.triggered_at = nowIso;
+          if (!a.repeat) {
+            a.is_active = false; // One-time alert deactivates after triggering
+          }
           triggered.push({ ...a, current_price: cur, is_triggered_now: true });
         }
       }
@@ -625,7 +828,9 @@ class ApiService {
   async getWallet(): Promise<PublicWallet> {
     try {
       return await this.tryBackend<PublicWallet>('/api/wallet');
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+
       const address = localStorage.getItem('defi_guardian_wallet_addr');
       if (!address) {
         return {
@@ -675,21 +880,28 @@ class ApiService {
   }
 
   async configureWallet(address: string) {
+    const trimmed = address.trim();
+    if (!ETH_ADDRESS_RE.test(trimmed)) {
+      throw new ApiValidationError('Invalid address: must be 42-char hex starting with 0x', 400);
+    }
+
     try {
       return await this.tryBackend<any>('/api/wallet/configure', {
         method: 'POST',
-        body: JSON.stringify({ address })
-      });
-    } catch {
-      localStorage.setItem('defi_guardian_wallet_addr', address);
-      return { success: true, address, message: 'Public wallet address configured' };
+        body: JSON.stringify({ address: trimmed })
+      }, true);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
+      localStorage.setItem('defi_guardian_wallet_addr', trimmed);
+      return { success: true, address: trimmed, message: 'Public wallet address configured' };
     }
   }
 
   async clearWallet() {
     try {
-      return await this.tryBackend<any>('/api/wallet/configure', { method: 'DELETE' });
-    } catch {
+      return await this.tryBackend<any>('/api/wallet/configure', { method: 'DELETE' }, true);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
       localStorage.removeItem('defi_guardian_wallet_addr');
       return { success: true, message: 'Public wallet configuration cleared' };
     }
@@ -700,16 +912,17 @@ class ApiService {
   ------------------------------------------------------------- */
   async resetDemo() {
     try {
-      await this.tryBackend('/api/demo/reset', { method: 'POST' });
-    } catch {
+      return await this.tryBackend<{ success: boolean; message: string }>('/api/demo/reset', { method: 'POST' }, true);
+    } catch (err) {
+      if (err instanceof ApiValidationError) throw err;
       localStorage.removeItem('defi_guardian_portfolio_v1');
       localStorage.removeItem('defi_guardian_trades_v1');
       localStorage.removeItem('defi_guardian_alerts_v1');
+      return {
+        success: true,
+        message: 'Paper account reset to $10,000 simulated cash. All paper trade records cleared.'
+      };
     }
-    return {
-      success: true,
-      message: 'Paper account reset to $10,000 simulated cash. All paper trade records cleared.'
-    };
   }
 }
 

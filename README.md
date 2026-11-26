@@ -88,21 +88,11 @@ The G2 display (576 × 288 pixels per eye, 16 shades of green) is organized into
 
 ---
 
-## 4. Local Machine Learning Engine
+## 4. Anomaly Detection Architecture (Backend ML vs Cloud-Edge)
 
-Unlike applications that rely on paid, cloud-hosted generative AI chatbots that hallucinate market facts, DeFi Guardian runs a **local, reproducible Python machine-learning model**:
-
-- **Model:** Scikit-Learn `IsolationForest(n_estimators=100, contamination=0.1, random_state=42)`.
-- **Training Data:** Real historical hourly candles retrieved from Hyperliquid (`candleSnapshot`).
-- **Engineered Features:**
-  1. Logarithmic price return: $r_t = \ln(close_t / open_t)$
-  2. Candle range %: $(high_t - low_t) / open_t \times 100$
-  3. Candle body conviction %: $|close_t - open_t| / (high_t - low_t + 10^{-8}) \times 100$
-  4. Logarithmic trading volume: $\ln(volume_t + 10^{-8})$
-  5. Relative volume against 24h baseline: $volume_t / (\text{mean}(volume_{t-24 \dots t-1}) + 10^{-8})$
-- **Inference Without Lookahead Bias:** The model trains on historical completed candles and evaluates the latest candle separately.
-- **Deterministic Explanations:** Transparent factor analysis templates constructed strictly from observed feature percentiles (e.g. *"Volume is 3.1x higher than recent 24h baseline"*).
-- **Safety Fallback:** If fewer than 24 candles are available, the model returns `MODEL WARMING UP` rather than guessing.
+- **Local FastAPI Backend Mode:** Runs Scikit-Learn `IsolationForest(n_estimators=100, contamination=0.1, random_state=42)` on historical Hyperliquid hourly candles (`candleSnapshot`) using 5 engineered features (log return, candle range %, candle body %, log volume, and 24h relative volume). Labeled **Isolation Forest ML Detector**.
+- **Cloud-Edge Browser Mode (Vercel):** When no local backend URL is configured, the frontend queries Hyperliquid directly and runs a deterministic **Rule-Based Statistical Detector** on the same candle features, labeled honestly as **Rule-Based Statistical Detector** (never claiming Isolation Forest in the browser).
+- **Safety Fallback:** If fewer than 24 candles are available, the detector reports `MODEL WARMING UP` rather than fabricating scores.
 
 ---
 

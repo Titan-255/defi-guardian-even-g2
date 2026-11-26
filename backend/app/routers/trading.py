@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List
 from app.schemas import (
     TradeRecord,
@@ -7,7 +7,8 @@ from app.schemas import (
     TradeConfirmRequest,
     TradeConfirmResponse
 )
-from app.services.paper_trading import paper_trading_service
+from app.security import verify_mutating_request
+from app.services.paper_trading import paper_trading_service, PriceDriftError
 
 router = APIRouter(prefix="/api/trades", tags=["Trading"])
 
@@ -36,19 +37,24 @@ async def preview_trade(req: TradePreviewRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Trade preview error: {str(e)}")
 
-@router.post("/confirm", response_model=TradeConfirmResponse)
+@router.post("/confirm", response_model=TradeConfirmResponse, dependencies=[Depends(verify_mutating_request)])
 async def confirm_trade(req: TradeConfirmRequest):
     """
     Executes a confirmed simulated paper trade and updates paper portfolio in SQLite.
+    Rejects stale or drifted quotes with HTTP 409 Conflict.
     Never executes real blockchain or exchange transactions.
     """
     try:
         trade_result = await paper_trading_service.execute_trade(
             coin=req.coin,
             action=req.action,
-            amount_usd=req.amount_usd
+            amount_usd=req.amount_usd,
+            preview_price=req.preview_price,
+            preview_timestamp=req.preview_timestamp,
         )
         return TradeConfirmResponse(**trade_result)
+    except PriceDriftError as pde:
+        raise HTTPException(status_code=409, detail=str(pde))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:

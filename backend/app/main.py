@@ -27,13 +27,13 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS for local development and Even Hub Simulator
+# Restrict CORS to explicitly configured frontend origins (no wildcard + credentials)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Permissive for local hackathon development & simulator
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Session-Token"],
 )
 
 # Register routers

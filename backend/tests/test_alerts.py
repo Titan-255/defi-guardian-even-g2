@@ -1,34 +1,48 @@
-def test_alerts_crud_and_check(client):
-    # 1. Create alert
-    create_res = client.post("/api/alerts", json={
-        "coin": "BTC",
-        "target_price": 50000.0,
-        "condition": "ABOVE"
-    })
+import math
+
+def test_alerts_one_time_trigger_fires_only_once(client, auth_headers):
+    # Create one-time alert: BTC >= 50000 (mock BTC is 60000)
+    create_res = client.post(
+        "/api/alerts",
+        json={"coin": "BTC", "target_price": 50000.0, "condition": "ABOVE"},
+        headers=auth_headers,
+    )
     assert create_res.status_code == 200
     alert_data = create_res.json()
-    assert alert_data["coin"] == "BTC"
-    assert alert_data["target_price"] == 50000.0
+    assert alert_data["is_active"] is True
     alert_id = alert_data["id"]
 
-    # 2. List alerts
-    list_res = client.get("/api/alerts")
-    assert list_res.status_code == 200
-    alerts = list_res.json()
-    assert any(a["id"] == alert_id for a in alerts)
+    # 1st check: triggers and deactivates
+    check1 = client.post("/api/alerts/check").json()
+    assert check1["triggered_count"] == 1
+    assert check1["triggered_alerts"][0]["id"] == alert_id
+    assert check1["triggered_alerts"][0]["is_active"] is False
 
-    # 3. Check alerts (BTC is > 50,000, so it should trigger)
-    check_res = client.post("/api/alerts/check")
-    assert check_res.status_code == 200
-    check_data = check_res.json()
-    assert check_data["triggered_count"] >= 1
-    assert any(a["id"] == alert_id for a in check_data["triggered_alerts"])
+    # 2nd & 3rd consecutive checks: must NOT fire again
+    check2 = client.post("/api/alerts/check").json()
+    check3 = client.post("/api/alerts/check").json()
+    assert check2["triggered_count"] == 0
+    assert check3["triggered_count"] == 0
 
-    # 4. Delete alert
-    del_res = client.delete(f"/api/alerts/{alert_id}")
+    # Delete alert
+    del_res = client.delete(f"/api/alerts/{alert_id}", headers=auth_headers)
     assert del_res.status_code == 200
+    assert not any(a["id"] == alert_id for a in client.get("/api/alerts").json())
 
-    # 5. Verify deleted
-    list_res2 = client.get("/api/alerts")
-    alerts2 = list_res2.json()
-    assert not any(a["id"] == alert_id for a in alerts2)
+
+def test_alert_validation(client, auth_headers):
+    # Unsupported coin
+    r1 = client.post("/api/alerts", json={"coin": "DOGE", "target_price": 1.0, "condition": "ABOVE"}, headers=auth_headers)
+    assert r1.status_code == 422
+
+    # Negative / zero price
+    r2 = client.post("/api/alerts", json={"coin": "BTC", "target_price": -100.0, "condition": "ABOVE"}, headers=auth_headers)
+    assert r2.status_code == 422
+
+    # Extremely large price
+    r3 = client.post("/api/alerts", json={"coin": "BTC", "target_price": 1e300, "condition": "ABOVE"}, headers=auth_headers)
+    assert r3.status_code == 422
+
+    # Invalid condition
+    r4 = client.post("/api/alerts", json={"coin": "BTC", "target_price": 50000.0, "condition": "EQUAL"}, headers=auth_headers)
+    assert r4.status_code == 422

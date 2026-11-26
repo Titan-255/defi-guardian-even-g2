@@ -19,13 +19,15 @@ export const AiInsight: React.FC<Props> = ({ intel, selectedCoin, onSelectCoin, 
           <span className="text-[11px] font-bold tracking-widest text-[#69f0ae]">AI MARKET INTELLIGENCE</span>
         </div>
         {/* Coin Selector */}
-        <div className="flex space-x-1">
+        <div className="flex space-x-1" role="group" aria-label="Select cryptocurrency for intelligence">
           {coins.map((c) => (
             <button
               key={c}
-              onClick={() => onSelectCoin(c)}
-              className={`text-[9px] px-1.5 py-0.5 rounded transition ${
-                selectedCoin === c ? 'bg-[#00e676] text-black font-bold' : 'bg-[#050f08] text-[#2e7d32] border border-[#1a3322]'
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onSelectCoin(c); }}
+              aria-pressed={selectedCoin === c}
+              className={`text-[10px] px-1.5 py-0.5 rounded transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#00e676] ${
+                selectedCoin === c ? 'bg-[#00e676] text-black font-bold' : 'bg-[#050f08] text-[#81c784] border border-[#1a3322]'
               }`}
             >
               {c}
@@ -36,8 +38,8 @@ export const AiInsight: React.FC<Props> = ({ intel, selectedCoin, onSelectCoin, 
 
       {/* Main Content Area */}
       {isLoading ? (
-        <div className="flex-1 flex items-center justify-center text-xs text-[#2e7d32] animate-pulse">
-          EVALUATING ISOLATION FOREST ON {selectedCoin}...
+        <div className="flex-1 flex items-center justify-center text-xs text-[#4caf50] animate-pulse">
+          ANALYZING {selectedCoin} CANDLES...
         </div>
       ) : intel ? (
         <div className="flex-1 flex flex-col justify-center py-1">
@@ -63,7 +65,7 @@ export const AiInsight: React.FC<Props> = ({ intel, selectedCoin, onSelectCoin, 
           </div>
 
           {/* Key Feature Metrics */}
-          <div className="grid grid-cols-3 gap-1 text-[9px] text-[#81c784]">
+          <div className="grid grid-cols-3 gap-1 text-[10px] text-[#81c784]">
             <div className="bg-[#050f08] p-1 border border-[#1a3322] rounded">
               <span>1h Return: </span>
               <span className="font-bold text-[#b9f6ca]">{intel.features.return_1h_pct ?? 0}%</span>
@@ -77,15 +79,18 @@ export const AiInsight: React.FC<Props> = ({ intel, selectedCoin, onSelectCoin, 
               <span className="font-bold text-[#b9f6ca]">{intel.features.candle_range_pct ?? 0}%</span>
             </div>
           </div>
+          <div className="text-[9px] text-[#4caf50] mt-1 truncate">
+            Detector: {intel.source}
+          </div>
         </div>
       ) : (
-        <div className="flex-1 flex items-center justify-center text-xs text-[#2e7d32]">
-          No intelligence data available
+        <div className="flex-1 flex items-center justify-center text-xs text-[#4caf50]">
+          Detector unavailable — unable to retrieve candles
         </div>
       )}
 
       {/* Footer */}
-      <div className="flex justify-between items-center text-[10px] text-[#2e7d32] border-t border-[#1a3322] pt-1">
+      <div className="flex justify-between items-center text-[10px] text-[#4caf50] border-t border-[#1a3322] pt-1">
         <span>Candle: {intel?.candle_time ? new Date(intel.candle_time).toLocaleTimeString() : '---'}</span>
         <span className="text-[#69f0ae]">Tap: Next Screen</span>
       </div>

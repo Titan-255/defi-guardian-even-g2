@@ -1,5 +1,10 @@
-from pydantic import BaseModel, Field
+import math
+import re
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, List, Optional, Any
+from app.config import settings
+
+ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 class HealthResponse(BaseModel):
     status: str
@@ -8,6 +13,7 @@ class HealthResponse(BaseModel):
     ml_engine_ready: bool
     database_ready: bool
     coingecko_enabled: bool
+    session_token: Optional[str] = None
     message: str
 
 class CoinPriceInfo(BaseModel):
@@ -27,16 +33,16 @@ class MarketOverviewResponse(BaseModel):
     is_cached: bool = False
 
 class CandleItem(BaseModel):
-    t: int # open time ms
-    T: int # close time ms
-    s: str # coin
-    i: str # interval
-    o: float # open
-    c: float # close
-    h: float # high
-    l: float # low
-    v: float # volume
-    n: int # count
+    t: int
+    T: int
+    s: str
+    i: str
+    o: float
+    c: float
+    h: float
+    l: float
+    v: float
+    n: int
 
 class CandlesResponse(BaseModel):
     coin: str
@@ -47,17 +53,17 @@ class CandlesResponse(BaseModel):
 
 class IntelligenceResponse(BaseModel):
     coin: str
-    classification: str # "UNUSUAL ACTIVITY", "NORMAL ACTIVITY", "MODEL WARMING UP"
+    classification: str
     is_anomaly: bool
-    anomaly_score: float # 0.0 to 100.0 scale (higher = more unusual)
+    anomaly_score: float
     raw_decision_score: float
-    severity: str # "LOW", "MODERATE", "HIGH"
+    severity: str
     explanation: str
     contributing_factors: List[str]
     features: Dict[str, float]
     candle_time: str
     sample_count: int
-    source: str = "Hyperliquid Candles + Local Isolation Forest"
+    source: str = "Hyperliquid Candles + Isolation Forest ML Detector"
     disclaimer: str = "Informational anomaly detection only. Not financial or predictive advice."
 
 class PublicWalletResponse(BaseModel):
@@ -72,6 +78,14 @@ class PublicWalletResponse(BaseModel):
 
 class ConfigureWalletRequest(BaseModel):
     address: str
+
+    @field_validator("address")
+    @classmethod
+    def validate_eth_address(cls, v: str) -> str:
+        addr = v.strip()
+        if not ETH_ADDRESS_RE.match(addr):
+            raise ValueError("Invalid Ethereum/Hyperliquid address: must match ^0x[0-9a-fA-F]{40}$")
+        return addr
 
 class PaperHoldingItem(BaseModel):
     coin: str
@@ -94,8 +108,15 @@ class PaperPortfolioResponse(BaseModel):
 
 class TradePreviewRequest(BaseModel):
     coin: str
-    action: str # "BUY" or "SELL"
-    amount_usd: float # e.g. 25, 50, 100
+    action: str
+    amount_usd: float
+
+    @field_validator("amount_usd")
+    @classmethod
+    def validate_amount(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0 or v > settings.MAX_TRADE_AMOUNT_USD:
+            raise ValueError(f"Trade amount must be finite and between $0 and ${settings.MAX_TRADE_AMOUNT_USD:,.0f}")
+        return v
 
 class TradePreviewResponse(BaseModel):
     valid: bool
@@ -110,13 +131,23 @@ class TradePreviewResponse(BaseModel):
     cash_after_trade: float
     current_holding: float
     holding_after_trade: float
+    preview_timestamp: Optional[str] = None
     is_paper: bool = True
     label: str = "SIMULATED ORDER PREVIEW"
 
 class TradeConfirmRequest(BaseModel):
     coin: str
-    action: str # "BUY" or "SELL"
+    action: str
     amount_usd: float
+    preview_price: Optional[float] = None
+    preview_timestamp: Optional[str] = None
+
+    @field_validator("amount_usd")
+    @classmethod
+    def validate_amount(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0 or v > settings.MAX_TRADE_AMOUNT_USD:
+            raise ValueError(f"Trade amount must be finite and between $0 and ${settings.MAX_TRADE_AMOUNT_USD:,.0f}")
+        return v
 
 class TradeConfirmResponse(BaseModel):
     success: bool
@@ -145,7 +176,32 @@ class TradeRecord(BaseModel):
 class AlertCreateRequest(BaseModel):
     coin: str
     target_price: float
-    condition: str # "ABOVE" or "BELOW"
+    condition: str
+    repeat: bool = False
+    cooldown_seconds: int = Field(default=300, ge=10, le=86400)
+
+    @field_validator("coin")
+    @classmethod
+    def validate_coin(cls, v: str) -> str:
+        c = v.strip().upper()
+        if c not in settings.SUPPORTED_COINS:
+            raise ValueError(f"Unsupported asset: {v}. Supported: {', '.join(settings.SUPPORTED_COINS)}")
+        return c
+
+    @field_validator("target_price")
+    @classmethod
+    def validate_target_price(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0 or v > settings.MAX_ALERT_PRICE:
+            raise ValueError(f"Target price must be finite, > 0, and <= ${settings.MAX_ALERT_PRICE:,.0f}")
+        return v
+
+    @field_validator("condition")
+    @classmethod
+    def validate_condition(cls, v: str) -> str:
+        cond = v.strip().upper()
+        if cond not in ("ABOVE", "BELOW"):
+            raise ValueError("Alert condition must be ABOVE or BELOW")
+        return cond
 
 class AlertResponse(BaseModel):
     id: int
@@ -153,10 +209,15 @@ class AlertResponse(BaseModel):
     target_price: float
     condition: str
     is_active: bool
+    repeat: bool = False
+    cooldown_seconds: int = 300
     created_at: str
     triggered_at: Optional[str] = None
     current_price: Optional[float] = None
     is_triggered_now: Optional[bool] = False
+
+class AlertCheckRequest(BaseModel):
+    prices: Optional[Dict[str, float]] = None
 
 class AlertCheckResult(BaseModel):
     triggered_count: int

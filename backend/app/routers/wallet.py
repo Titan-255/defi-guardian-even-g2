@@ -1,11 +1,14 @@
-from fastapi import APIRouter, HTTPException
+import re
+from fastapi import APIRouter, Depends, HTTPException
 from typing import Optional
 from app.schemas import PublicWalletResponse, ConfigureWalletRequest
+from app.security import verify_mutating_request
 from app.database import get_connection
 from app.services.hyperliquid import hyperliquid_service
 from app.config import settings
 
 router = APIRouter(prefix="/api/wallet", tags=["Wallet"])
+ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 def get_configured_address() -> Optional[str]:
     conn = get_connection()
@@ -55,7 +58,6 @@ async def get_wallet():
     total_margin = float(margin_summary.get("totalMarginUsed", 0.0))
     withdrawable = float(data.get("withdrawable", 0.0))
 
-    # Parse positions
     positions = []
     raw_positions = data.get("assetPositions", [])
     for pos_item in raw_positions:
@@ -81,12 +83,12 @@ async def get_wallet():
         message="Read-only public wallet loaded successfully"
     )
 
-@router.post("/configure")
+@router.post("/configure", dependencies=[Depends(verify_mutating_request)])
 def configure_wallet(req: ConfigureWalletRequest):
     """Configures a public wallet address for read-only monitoring."""
     address = req.address.strip()
-    if not address.startswith("0x") or len(address) != 42:
-        raise HTTPException(status_code=400, detail="Address must be a 42-character hex address starting with 0x")
+    if not ETH_ADDRESS_RE.match(address):
+        raise HTTPException(status_code=400, detail="Address must match ^0x[0-9a-fA-F]{40}$")
 
     conn = get_connection()
     c = conn.cursor()
@@ -100,7 +102,7 @@ def configure_wallet(req: ConfigureWalletRequest):
 
     return {"success": True, "address": address, "message": "Public wallet address configured"}
 
-@router.delete("/configure")
+@router.delete("/configure", dependencies=[Depends(verify_mutating_request)])
 def clear_wallet():
     """Removes configured public wallet address."""
     conn = get_connection()

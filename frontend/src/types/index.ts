@@ -1,4 +1,4 @@
-export type ScreenId = 
+export type ScreenId =
   | 'MARKET'
   | 'INTELLIGENCE'
   | 'PORTFOLIO'
@@ -7,6 +7,8 @@ export type ScreenId =
   | 'ALERTS'
   | 'SETTINGS';
 
+export type OperatingMode = 'BACKEND' | 'CLOUD_EDGE' | 'OFFLINE';
+
 export interface BackendHealth {
   status: string;
   timestamp: string;
@@ -14,6 +16,7 @@ export interface BackendHealth {
   ml_engine_ready: boolean;
   database_ready: boolean;
   coingecko_enabled: boolean;
+  session_token?: string;
   message: string;
 }
 
@@ -37,7 +40,7 @@ export interface MarketOverview {
 
 export interface IntelligenceData {
   coin: string;
-  classification: string; // "UNUSUAL ACTIVITY", "NORMAL ACTIVITY", "MODEL WARMING UP"
+  classification: string; // "UNUSUAL ACTIVITY", "NORMAL ACTIVITY", "MODEL WARMING UP", "UNAVAILABLE"
   is_anomaly: boolean;
   anomaly_score: number;
   raw_decision_score: number;
@@ -90,6 +93,7 @@ export interface TradePreview {
   cash_after_trade: number;
   current_holding: number;
   holding_after_trade: number;
+  preview_timestamp?: string;
   is_paper: boolean;
   label: string;
 }
@@ -112,6 +116,8 @@ export interface PriceAlert {
   target_price: number;
   condition: 'ABOVE' | 'BELOW';
   is_active: boolean;
+  repeat?: boolean;
+  cooldown_seconds?: number;
   created_at: string;
   triggered_at?: string;
   current_price?: number;

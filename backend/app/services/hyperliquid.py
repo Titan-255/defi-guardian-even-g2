@@ -1,21 +1,24 @@
 import httpx
+import re
 import time
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, Any, Optional
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
 # In-memory short-lived cache to avoid hammering Hyperliquid and ensure instant responses
 _CACHE = {
-    "all_mids": {"data": None, "timestamp": 0},
-    "candles": {}, # key: f"{coin}_{interval}" -> {"data": None, "timestamp": 0}
-    "wallet": {},  # key: address -> {"data": None, "timestamp": 0}
+    "all_mids": {"data": None, "timestamp": 0.0},
+    "candles": {}, # key: f"{coin}_{interval}" -> {"data": None, "timestamp": 0.0}
+    "wallet": {},  # key: address -> {"data": None, "timestamp": 0.0}
 }
 
-CACHE_TTL_MIDS_SECONDS = 3.0
-CACHE_TTL_CANDLES_SECONDS = 15.0
-CACHE_TTL_WALLET_SECONDS = 10.0
+CACHE_TTL_MIDS_SECONDS = 5.0
+CACHE_TTL_CANDLES_SECONDS = 120.0
+CACHE_TTL_WALLET_SECONDS = 15.0
 
 class HyperliquidService:
     def __init__(self, api_url: Optional[str] = None):
@@ -51,15 +54,19 @@ class HyperliquidService:
         if cached["data"]:
             return {"data": cached["data"], "is_cached": True, "error": "Using cached market data"}
 
-        # If no cache exists, return empty fallback
-        return {"data": {}, "is_cached": True, "error": "Hyperliquid API currently unavailable"}
+        return {"data": {}, "is_cached": False, "error": "Hyperliquid API currently unavailable"}
 
     async def get_candles(self, coin: str, interval: str = "1h", hours_back: int = 72) -> Dict[str, Any]:
         """
-        Fetches historical candle snapshots for a coin.
-        API schema: { 'type': 'candleSnapshot', 'req': { 'coin': 'BTC', 'interval': '1h', 'startTime': ms, 'endTime': ms } }
+        Fetches historical candle snapshots for a validated coin and interval.
         """
-        cache_key = f"{coin.upper()}_{interval}"
+        coin_upper = coin.strip().upper()
+        if coin_upper not in settings.SUPPORTED_COINS:
+            raise ValueError(f"Unsupported asset: {coin}. Supported: {', '.join(settings.SUPPORTED_COINS)}")
+        if interval not in settings.SUPPORTED_INTERVALS:
+            raise ValueError(f"Unsupported interval: {interval}. Supported: {', '.join(settings.SUPPORTED_INTERVALS)}")
+
+        cache_key = f"{coin_upper}_{interval}_{hours_back}"
         now = time.time()
         cached = _CACHE["candles"].get(cache_key)
         if cached and (now - cached["timestamp"] < CACHE_TTL_CANDLES_SECONDS):
@@ -75,7 +82,7 @@ class HyperliquidService:
                     json={
                         "type": "candleSnapshot",
                         "req": {
-                            "coin": coin.upper(),
+                            "coin": coin_upper,
                             "interval": interval,
                             "startTime": start_ms,
                             "endTime": now_ms
@@ -85,7 +92,6 @@ class HyperliquidService:
                 )
                 if response.status_code == 200:
                     raw_candles = response.json()
-                    # Parse numerical fields
                     parsed_candles = []
                     for c in raw_candles:
                         try:
@@ -101,28 +107,29 @@ class HyperliquidService:
                                 "v": float(c["v"]),
                                 "n": int(c.get("n", 0))
                             })
-                        except (ValueError, KeyError) as parse_err:
+                        except (ValueError, KeyError):
                             continue
-                    
+
                     _CACHE["candles"][cache_key] = {"data": parsed_candles, "timestamp": now}
                     return {"candles": parsed_candles, "is_cached": False, "error": None}
         except Exception as e:
-            logger.error(f"Error fetching Hyperliquid candles for {coin}: {e}")
+            logger.error(f"Error fetching Hyperliquid candles for {coin_upper}: {e}")
 
         if cached and cached["data"]:
             return {"candles": cached["data"], "is_cached": True, "error": "Using cached candles"}
 
-        return {"candles": [], "is_cached": True, "error": f"Failed to retrieve candles for {coin}"}
+        return {"candles": [], "is_cached": False, "error": f"Failed to retrieve candles for {coin_upper}"}
 
     async def get_clearinghouse_state(self, address: str) -> Dict[str, Any]:
         """
-        Fetches public margin and position details for an address from Hyperliquid.
+        Fetches public margin and position details for a validated address from Hyperliquid.
         """
-        if not address or not address.startswith("0x") or len(address) != 42:
-            return {"error": "Invalid Ethereum/Hyperliquid wallet address format (must be 42-char hex starting with 0x)"}
+        addr = (address or "").strip()
+        if not ETH_ADDRESS_RE.match(addr):
+            return {"error": "Invalid Ethereum/Hyperliquid wallet address format (must match ^0x[0-9a-fA-F]{40}$)"}
 
         now = time.time()
-        cached = _CACHE["wallet"].get(address)
+        cached = _CACHE["wallet"].get(addr)
         if cached and (now - cached["timestamp"] < CACHE_TTL_WALLET_SECONDS):
             return {"data": cached["data"], "is_cached": False, "error": None}
 
@@ -130,19 +137,19 @@ class HyperliquidService:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 response = await client.post(
                     self.api_url,
-                    json={"type": "clearinghouseState", "user": address},
+                    json={"type": "clearinghouseState", "user": addr},
                     headers={"Content-Type": "application/json"}
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    _CACHE["wallet"][address] = {"data": data, "timestamp": now}
+                    _CACHE["wallet"][addr] = {"data": data, "timestamp": now}
                     return {"data": data, "is_cached": False, "error": None}
         except Exception as e:
-            logger.error(f"Error fetching clearinghouse state for {address}: {e}")
+            logger.error(f"Error fetching clearinghouse state for {addr}: {e}")
 
         if cached and cached["data"]:
             return {"data": cached["data"], "is_cached": True, "error": "Using cached wallet data"}
 
-        return {"data": None, "is_cached": True, "error": "Could not connect to Hyperliquid for wallet data"}
+        return {"data": None, "is_cached": False, "error": "Could not connect to Hyperliquid for wallet data"}
 
 hyperliquid_service = HyperliquidService()
