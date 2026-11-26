@@ -1,6 +1,8 @@
 # DEFI GUARDIAN — Submission Overview
 
 > **Your Crypto Intelligence. Just a Glance Away.**  
+> **Live Web Demo:** [https://defi-guardian-eight.vercel.app](https://defi-guardian-eight.vercel.app)  
+> **GitHub Repository:** [https://github.com/Titan-255/defi-guardian-even-g2](https://github.com/Titan-255/defi-guardian-even-g2)  
 > Built for the **Heads Up: Even Realities Hackathon** by Even Realities, TVM Ventures, and DAOs Hub  
 > Track: **Crypto & DeFi**
 

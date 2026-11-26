@@ -3,10 +3,12 @@
 
 [![Hackathon](https://img.shields.io/badge/Hackathon-Heads_Up:_Even_Realities-00e676?style=for-the-badge)](https://dorahacks.io/hackathon/even-realities/detail)
 [![Track](https://img.shields.io/badge/Track-Crypto_%26_DeFi-00e676?style=for-the-badge)](https://dorahacks.io/hackathon/even-realities/detail)
+[![Live Demo](https://img.shields.io/badge/Vercel-Live_Demo-black?style=for-the-badge&logo=vercel)](https://defi-guardian-eight.vercel.app)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-13%2F13_Passed-success?style=for-the-badge)](TEST_REPORT.md)
 
 > **"Your Crypto Intelligence. Just a Glance Away."**  
+> **Live Web & G2 Simulator Preview:** [https://defi-guardian-eight.vercel.app](https://defi-guardian-eight.vercel.app)  
 > Built for the **Heads Up: Even Realities Hackathon** organized by Even Realities, TVM Ventures, and DAOs Hub.
 
 ---

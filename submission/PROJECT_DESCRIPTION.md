@@ -7,7 +7,8 @@
 - **Competition:** Heads Up: Even Realities Hackathon by Even Realities, TVM Ventures and DAOs Hub
 - **Target Hardware:** Even Realities G2 Smart Glasses (Optical Waveguide, 576 × 288 per eye, 16-shade monochrome green)
 - **Developer:** Solo Builder (College Student)
-- **Repository:** `defi-guardian-even-g2`
+- **Live Demo URL:** [https://defi-guardian-eight.vercel.app](https://defi-guardian-eight.vercel.app)
+- **Repository:** `defi-guardian-even-g2` ([https://github.com/Titan-255/defi-guardian-even-g2](https://github.com/Titan-255/defi-guardian-even-g2))
 
 ---
 
