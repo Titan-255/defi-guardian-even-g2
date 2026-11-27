@@ -40,7 +40,7 @@ export const CompanionView: React.FC<Props> = ({
   const screens: { id: ScreenId; title: string; num: string }[] = [
     { id: 'MARKET', title: 'Market Glance', num: '1' },
     { id: 'INTELLIGENCE', title: 'AI Anomaly Engine', num: '2' },
-    { id: 'PORTFOLIO', title: 'Paper Portfolio', num: '3' },
+    { id: 'PORTFOLIO', title: 'Portfolio', num: '3' },
     { id: 'ATTENTION', title: 'Market Attention', num: '4' },
     { id: 'TRADING', title: 'Paper Trading', num: '5' },
     { id: 'ALERTS', title: 'Price Alerts', num: '6' },
